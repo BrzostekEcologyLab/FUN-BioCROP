@@ -1,0 +1,1177 @@
+---
+title: "FUN-BioCROP"
+author: "Stephanie Juice"
+date: "10/1/2021"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+For full information see ReadMe file: "ReadMe_FUN-BioCROP.md"
+
+This code runs the FUN-BioCROP model,  a version of FUN-CORPSE (Sulman et al 2017 Ecology Letters) that we modified for bioenergy systems.
+
+Each row of output data is one day, each column is one site. This file runs one site in duplicate.  
+
+
+```{r Remove all functions clear memory}
+
+rm(list=ls(all=TRUE)) 
+
+```
+
+
+```{r Load Packages}
+library(ggplot2)
+library(plyr) 
+library(dplyr) 
+
+```
+
+
+```{r Load CORPSE Data Streams}
+
+# Set working directory
+setwd("") # add filepath for working directory
+
+# Initial C and N pool values for bulk, rhizophere and litter layers (kg C or N/m2, from 3000 year spinup)
+# columns are different SOM pools, rows are for each site
+spinup_bulk_till_int<-read.csv("bulk_till.csv", header = TRUE)
+spinup_bulk_int<-read.csv("bulk.csv", header = TRUE)
+spinup_rhizo_till_int<-read.csv("rhizo_till.csv", header = TRUE)
+spinup_rhizo_int<-read.csv("rhizo.csv", header = TRUE)
+litter_int<-read.csv("litter.csv", header = TRUE)
+
+
+# Soil temperature and moisture- both at 10 cm, average daily values of UIUC Energy Farm flux tower data from 7/2008-3/2016
+# each row is one day, days of year 1-365
+soilT<-as.matrix(read.csv("FluxTower_AvgSoilT.csv"))
+soilVWC<-as.matrix(read.csv("FluxTower_AvgSoilVWC.csv"))
+
+# Input file with DayCent values
+# Each row is one day
+input <- read.csv("input.csv", header = TRUE) # in kg C or N/m2
+
+```
+
+
+```{r Load CORPSE Functions}
+
+## Load CORPSE functions 
+
+##CORPSE decomposition function
+source("CORPSE Functions_Bioenergy.R")
+
+##Initialize model bug diagnostic function
+crash<-function(message) {cat(message);break}
+
+
+```
+
+
+```{r Load Parameters}
+
+### Tillage Parameters
+# assign values for percent soil tilled and percent protected C moved to unprotected C following tillage
+pct_till <- 0.15 # percent soil assigned to the till layer (rhizo and bulk only)
+tillPtoUP <- 0.3 # percent of protected C and N moved to unprotected pools following tillage
+
+
+# Set the number of plots and years for running the model
+nyears <- max(input$nyr)
+nsites <- 2 
+timestep <- length(input[,1])
+CORPSEstep <- 1/365 # this scales the data to be a daily value from CORPSE function
+FUNstep <- 365
+
+
+##Data frame with CORPSE parameters
+# These are defined in "CORPSE Functions_Bioenergy.R"
+params<-data.frame(
+  "Vmaxref_Fast" = 9.0,
+  "Vmaxref_Slow" = 0.25,
+  "Vmaxref_Necro"= 4.5,
+  "Ea_Fast" = 5e3,
+  "Ea_Slow" = 30e3,
+  "Ea_Necro"= 3e3,
+  "kC_Fast" = 0.01,
+  "kC_Slow" = 0.01,
+  "kC_Necro"= 0.01,
+  "gas_diffusion_exp" = 0.6,
+  "minMicrobeC" = 1e-3,
+  "Tmic"= 0.25,
+  "et" = 0.6,
+  "eup_Fast" = 0.6,
+  "eup_Slow"= 0.1,
+  "eup_Necro" = 0.6,
+  "tProtected" = 100.0,
+  "frac_N_turnover_min" = 0.2,
+  "protection_rate_Fast" = 0.7,
+  "protection_rate_Slow" = 0.001, 
+  "protection_rate_Necro" = 4.0,
+  "nup_Fast" = 0.3,
+  "nup_Slow" = 0.3,
+  "nup_Necro" = 0.3,
+  "CN_Microbe" = 7,
+  "max_immobilization_rate" = 3.65,
+  "substrate_diffusion_exp" = 1.5,
+  "new_resp_units" = TRUE,
+  "iN_loss_rate" = 5.0,
+  "frac_turnover_slow" = 0.2
+)
+
+
+##Set fixed parameter values for CORPSE and FUN
+
+##CORPSE  leaf and root litter parameters
+litter_transfer_to_soil<-1/365
+
+##FUN fixed parameters
+storageCN<-1 #This number is the C:N ratio of glutamic acid
+exudate_CN<-30
+cost_param_mult<-1.0 # multiplier
+
+
+## FUN Fixed parameters for Costfix equation, based on Houlton et al. 2008
+a_fix<-(-3.62)
+b_fix<-0.27
+c_fix<-25.14
+s_fix<-(-30)
+
+##FUN Resorb cost parameters (cost_resorb)
+kR<-0.005 ##controls cost of retranslocation associated with leaf N
+
+##FUN Non mycorrhizal cost parameters ## multipliers turned off 
+Non_kN<-(0.6/365) #*(cost_param_mult) 
+Non_kC<-(0.01/365) #*(cost_param_mult*2e6)
+
+##FUN Mycorrhizal cost parameters ## multipliers turned off
+kC<-(0.05/365) #*(cost_param_mult*2e6) ##reflect  fungi tradeoffs 
+kN<-(0.1/365) #*(cost_param_mult/2)
+
+
+##Set CORPSE input values for C and N input rates
+
+claymod<-1.0  #Scalar that modifies the ability of clays to sorb and protect C
+
+exudate_Cinput<-0.03
+exudate_Ninput<-0.001
+
+inorg_Ndep<-0.01
+
+
+```
+
+
+```{r Prepare Data Streams}
+
+# add together tilled and not tilled layers from spinup (because spinup was tallgrass prairie, no tillage occured so we need the sum to then assign the percent to the tilled compartments)
+spinup_mix_bulk <- spinup_bulk_till_int + spinup_bulk_int
+spinup_mix_rhizo <- spinup_rhizo_till_int + spinup_rhizo_int
+
+# assign SOM to tilled layer and not-tilled layer, rhizo and bulk
+bulk_till_int <- spinup_mix_bulk*pct_till
+bulk_int <- spinup_mix_bulk*(1-pct_till)
+rhizo_till_int <- spinup_mix_rhizo*pct_till
+rhizo_int <- spinup_mix_rhizo*(1-pct_till)
+
+
+# Set up initial files to have two rows because code is set up for 2 sites
+bulk_int[2,] <- bulk_int[1,]
+bulk_till_int[2,] <- bulk_till_int[1,]
+rhizo_int[2,] <- rhizo_int[1,]
+rhizo_till_int[2,] <- rhizo_till_int[1,]
+litter_int[2,] <- litter_int[1,]
+
+
+# Define daily values based on "input" file of DayCent data
+daily_ANPP <- cbind(input$anpp, input$anpp)  # anpp
+daily_root_prod <- cbind(input$bnpp, input$bnpp)  # bnpp
+daily_NPP <-cbind(input$anpp + input$bnpp, input$anpp + input$bnpp) #total npp
+daily_root_bio <- cbind(input$bglivcm + input$bglivcj,
+                        input$bglivcm + input$bglivcj)  
+daily_root_bio_juv<- cbind(input$bglivcj,
+                           input$bglivcj)  
+
+# Make datatables of daily turnover values
+froot_turnover_c <- input$froot_turnover_c
+froot_turnover_n <- input$froot_turnover_n
+agrd_turnover_c <- input$agrd_turnover_c
+agrd_turnover_n <- input$agrd_turnover_n
+
+```
+
+
+```{r Set Initial Conditions}
+
+##Set CORPSE initial conditions using data streams
+
+##Empty data frame with column names for:
+# pools -- u=unprotected, p=protected
+# chem_types -- Fast, Slow, Necro
+# for each soil compartment
+pool_column_names<-c("uFastC", "uSlowC", "uNecroC",
+                     "pFastC", "pSlowC", "pNecroC",
+                     "livingMicrobeC",
+                     "uFastN", "uSlowN", "uNecroN",
+                     "pFastN", "pSlowN", "pNecroN",
+                     "inorganicN",
+                     "CO2",
+                     "livingMicrobeN")
+ncolnames<-length(pool_column_names)
+bulk<-data.frame(matrix(0,ncol = ncolnames,nrow = nsites))
+names(bulk)<-pool_column_names
+
+# The structure is the same for all layers:
+# bulk_till, bulk, rhizo_till, rhizo, litter
+bulk_till <- bulk 
+bulk<-bulk
+rhizo_till <- bulk
+rhizo<-bulk
+litter<-bulk
+
+##Set up lists to hold CORPSE model outputs
+# bulk, rhizosphere, and litter layers (as they change over time)
+bulk_till_final_list <- list()
+bulk_final_list<-list()
+rhizo_till_final_list <- list()
+rhizo_final_list<-list()
+litter_final_list<-list()
+
+
+## CORPSE assumes that inorganic N is the same across layers
+shared_inorganicN<-numeric(nsites)
+
+
+##Initial Values for all layers (all units are in kg/m-2) 
+bulk_till[1:nsites,1:ncolnames]<-bulk_till_int[1:nsites,1:ncolnames]
+bulk_till$livingMicrobeN<-bulk_till$livingMicrobeC/params$CN_Microbe
+
+bulk[1:nsites,1:ncolnames]<-bulk_int[1:nsites,1:ncolnames]
+bulk$livingMicrobeN<-bulk$livingMicrobeC/params$CN_Microbe
+
+rhizo_till[1:nsites,1:ncolnames]<-rhizo_till_int[1:nsites,1:ncolnames]
+rhizo_till$livingMicrobeN<-rhizo_till$livingMicrobeC/params$CN_Microbe
+
+rhizo[1:nsites,1:ncolnames]<-rhizo_int[1:nsites,1:ncolnames]
+rhizo$livingMicrobeN<-rhizo$livingMicrobeC/params$CN_Microbe
+
+litter[1:nsites,1:ncolnames]<-litter_int[1:nsites,1:ncolnames]
+litter$livingMicrobeN<-litter$livingMicrobeC/params$CN_Microbe
+
+
+# Initializing shared inorganic N pool 
+shared_inorganicN<-bulk$inorganicN
+
+```
+
+
+```{r Load FUN Data and Set Up Matrices}
+
+k<-1:FUNstep
+
+# First calculate amount of  root production and N needed - how much N needed for the timestep
+# root N demand - daily N used to produce new beloground biomass
+rootNdemand <- matrix(0,nrow=timestep, ncol = nsites)
+for (i in 2:length(rootNdemand)) {
+  rootNdemand[i] <- (input$bglivnj[i] + input$bglivnm[i]) -
+                    (input$bglivnj[i-1] + input$bglivnm[i-1])
+}
+rootNdemand[rootNdemand < 0] <- 0
+rootNdemand[,2] <- rootNdemand[,1]
+
+
+# leafNdemand- daily N used to produce new aboveground biomass
+leafNdemand <- matrix(0,nrow=timestep, ncol = nsites)
+for (i in 2:length(leafNdemand)) {
+  leafNdemand[i] <- (input$aglivn[i]) - (input$aglivn[i-1])
+}
+leafNdemand[leafNdemand < 0] <- 0
+leafNdemand[,2] <- leafNdemand[,1]
+
+
+# NPP
+NPP<-daily_NPP
+
+# Calculate total N demand
+totalNdemand<-rootNdemand+leafNdemand
+
+# Calculate plantCN
+plantCN<-NPP/totalNdemand
+plantCN[is.nan(plantCN)] = 0
+
+# Replenish N stores during senescence
+storageNdemand<-matrix(0,nrow=length(NPP),ncol=nsites)
+
+storageNdemand <- vector()
+for (i in 1:length(input$yr)){
+  if (input$last[i] == 1 && input$harv[i] == 0){
+    storageNdemand[i] <- input$aglivn[i-1] * 0.7
+  } else storageNdemand[i] <- 0
+}
+
+# Calculate leaf N available for retranslocation and the amount of C in litter. Litter production values also used in CORPSE model for intial litter inputs.
+# If you have a harvest, remove, else retranslocatable N is N pool on last growth day
+leafN <- matrix(0,nrow = length(input$aglivc), ncol = 4)
+leafN[,1] <- input$last
+leafN[,2] <- input$harv
+leafN[,3] <- input$aglivn
+for (i in 1:length(leafN[,1])){
+  if (leafN[i,2] == 1){ # if there is a harvest
+     leafN[i,4] <- leafN[i-1,3] * (1 - input$harvremov[i])  # retranslocatable leaf N pool
+  }  else if (leafN[i,1] == 1){ # if it is the last growing day
+     leafN[i,4] <- leafN[i-1,3]
+  } 
+} 
+
+# Calculate litter production if there is harvest
+litter_production_c <- vector()
+litter_production_n <- vector()
+litter_production_c <- agrd_turnover_c
+litter_production_n <- agrd_turnover_n
+# Code for annuals: 
+for (i in 1:length(input[,1])) {
+  if (input$harv[i] == 1){
+    litter_production_c[i] <- litter_production_c[i] * (1 - input$harvremov[i])
+    litter_production_n[i] <- litter_production_n[i] * (1 - input$harvremov[i])
+  } 
+}
+# Code for perennials (used in Energy Farm runs due to harvest timing): Feedstock Harvests occur early in the year to harvest the previous year's plants, so need to reduce all agrd_turnover_c by harvest % otherwise all the aboveground biomass goes into the litter pool
+# litter_production_c <- agrd_turnover_c*0.15
+# litter_production_n <- agrd_turnover_n*0.15
+
+# Initialize the N and C storage pools. The N is used to grow leaves in spring.
+# Also determine demand in the Fall and C is used for retranslocation
+
+CORPSEstorageN<-vector()
+storageC<-vector()
+
+CORPSEstorageN<-storageNdemand  
+
+leafCN_frame <- input[,c("yr", "doy", "aglivc", "aglivn", "last")]
+for (i in 1:length(leafCN_frame[,"aglivc"])){
+  if (leafCN_frame[i,"last"] == 1 & leafCN_frame[i, "aglivc"] == 0){
+     leafCN_frame[i,"aglivc"] <- leafCN_frame[i-1,"aglivc"]
+     leafCN_frame[i,"aglivn"] <- leafCN_frame[i-1,"aglivn"]
+  } 
+}
+leafCN <- leafCN_frame$aglivc/leafCN_frame$aglivn
+
+storageC<-storageNdemand * leafCN # assuming that the storage pool of C is equal to the leaf litter C pool
+
+
+
+### Create empty matrices for FUN model outputs 
+
+Npassive<-matrix(NA,nrow=timestep,ncol=nsites) ##(kg N/m2/timestep) amount of N taken up through passive uptake
+free<-matrix(NA,nrow=timestep,ncol=nsites)
+storageNmob<-matrix(NA,nrow=timestep,ncol=nsites)
+FUNstorageN<-matrix(NA,nrow=timestep+1,ncol=nsites)
+FUNstorageN[,1]<-c(0,CORPSEstorageN)
+FUNstorageN[,2]<-c(0,CORPSEstorageN)
+cost_active<-matrix(NA,nrow=timestep,ncol=nsites) ##(kg N/m2/timestep) cost of active N uptake
+cost_fix<-matrix(NA,nrow=timestep,ncol=nsites) ##(kg C/m2/timestep) cost of N fixation
+cost_resorb<-matrix(NA,nrow=timestep,ncol=nsites) ##(kg C/m2/timestep) cost of resorption of leaf N
+cost_non_myco<-matrix(NA,nrow=timestep,ncol=nsites) ##(kg C/m2/timestep) cost of non-mycorrhizal active N uptake
+cost_acq<-matrix(NA,nrow=timestep,ncol=nsites) ##(kg C/m2/timestep) minimum of cost 1) fixation, 2) active, 3) resorb
+rec_cost_acq<-matrix(NA,nrow=timestep,ncol=nsites)
+Cgrowth<-matrix(NA,nrow=timestep,ncol=nsites) ##(kg C/m2/timestep) C available for NPP and growth
+Cgrowth<-NPP  
+Cacq<-matrix(NA,nrow=timestep,ncol=nsites) ##(kg C/m2/timestep) C expended on N uptake
+Nacq<-matrix(NA,nrow=timestep,ncol=nsites) ##(kg N/m2/timestep) Total N taken up
+Cavailable<-matrix(NA,nrow=timestep,ncol=nsites)
+Cavailable<-NPP ##C available to expend to growth or N uptake
+rsoilN<-matrix(NA,nrow=timestep,ncol=nsites) ##soilN remaining after passive uptake
+Ndeficit<-matrix(NA,nrow=timestep,ncol=nsites) ##N uptake needed to meet N demand
+total_Nacq<-matrix(0,nrow=timestep,ncol=nsites) 
+total_Cgrowth<-matrix(0,nrow=timestep,ncol=nsites)
+total_Nacq_active<-matrix(0,nrow=timestep,ncol=nsites) 
+total_Nacq_resorb<-matrix(0,nrow=timestep,ncol=nsites)
+total_Nacq_fix<-matrix(0,nrow=timestep,ncol=nsites)
+total_Nacq_non_myco<-matrix(0,nrow=timestep,ncol=nsites)
+total_Nacq_storage<-matrix(0,nrow=timestep,ncol=nsites)
+litter_productionN<-matrix(NA,nrow=timestep,ncol=nsites)
+litter_productionCN<-matrix(NA,nrow=timestep,ncol=nsites)
+rhizoC_flux<-matrix(0,nrow=timestep,ncol=nsites)
+fungal_prod<-matrix(0,nrow=timestep,ncol=nsites)
+Ndemand_plus_storage<-matrix(NA,nrow=timestep,ncol=nsites)
+NPP_plus_storage<-matrix(NA,nrow=timestep,ncol=nsites)
+resorbper<-matrix(NA,nrow=1,ncol=nsites)
+cost_storage<-matrix(2.0e-3,nrow=timestep,ncol=nsites)
+
+FUN_shared_inorganicN<-matrix(NA,nrow=timestep,ncol=nsites)
+total_soil_N_uptake<-matrix(NA,nrow=timestep,ncol=nsites)
+N_uptakescaler<-matrix(NA,nrow=timestep,ncol=nsites)
+Nacq_scaler<-matrix(NA,nrow=timestep,ncol=nsites)
+
+
+```
+
+
+```{r Run Model}
+
+##loop happens for nyears for nsites
+#i=1;j=1;k=1
+
+for (i in 1:timestep) {
+  
+  ##Start CORPSE model main loop
+  
+  #Parse step into DOY 
+  ##this takes the timestep and makes it into DOY
+  k <- ((i-1)%%365)+1
+  
+  ##Get Temperature and theta (soil moisture) values for this time point
+  T_step <- soilT[k]+273.15
+  porosity <- 0.5
+  theta_step <- soilVWC[k,1]/porosity 
+  
+  ##Running the CORPSE function 
+  bulk_till$inorganicN <- shared_inorganicN
+  results_bulk_till <-
+    CORPSE(bulk_till, T_step, theta_step, params, claymod, Litter=FALSE)
+  shared_inorganicN <- 
+    shared_inorganicN+CORPSEstep*results_bulk_till$inorganicN
+  
+  bulk$inorganicN <- shared_inorganicN
+  results_bulk <- 
+    CORPSE(bulk, T_step, theta_step, params, claymod, Litter=FALSE)
+  shared_inorganicN <- 
+    shared_inorganicN+CORPSEstep*results_bulk$inorganicN
+  
+  rhizo_till$inorganicN <- shared_inorganicN
+  results_rhizo_till <- 
+    CORPSE(rhizo_till, T_step, theta_step, params, claymod, Litter=FALSE)
+  shared_inorganicN <- 
+    shared_inorganicN+CORPSEstep*results_rhizo_till$inorganicN
+  
+  rhizo$inorganicN <- shared_inorganicN
+  results_rhizo <- 
+    CORPSE(rhizo,  T_step, theta_step, params, claymod,Litter=FALSE)
+  shared_inorganicN <- 
+    shared_inorganicN+CORPSEstep*results_rhizo$inorganicN
+  
+  litter$inorganicN <- shared_inorganicN
+  results_litter <- 
+    CORPSE(litter, T_step, theta_step, params, claymod, Litter=TRUE)
+  shared_inorganicN <- 
+    shared_inorganicN+CORPSEstep*results_litter$inorganicN
+  
+  ##Update shared inorganic N pool for each layer to take into account inputs (inorg_Ndep) and outputs for inorganic N removal (from plant roots, leaching, etc)
+  ##Record mineralization and immobilization from rates of N pools by timestep
+  
+  #Add and subtract all changes from shared inorganic N pool
+  shared_inorganicN <- 
+    shared_inorganicN + CORPSEstep * (inorg_Ndep-params$iN_loss_rate * 
+                                        shared_inorganicN)
+  ##model will stop if shared inorganic N < 0
+  if(min(shared_inorganicN)<0) {crash('Inorganic N < 0')}
+  
+  ##Update the pools in SOM by add derivs*dt (length of time step) to each SOM pool.  
+  ##This simply converts the units from mass per year to mass per the   selected time step
+  bulk_till <- bulk_till + results_bulk_till*CORPSEstep
+  bulk_till$inorganicN <- shared_inorganicN
+  if(min(bulk_till)<0) {crash('Value is bulk_till < 0')}
+  
+  bulk <- bulk + results_bulk*CORPSEstep
+  bulk$inorganicN <- shared_inorganicN
+  if(min(bulk)<0) {crash('Value is bulk < 0')}
+  
+  rhizo_till <- rhizo_till + results_rhizo_till*CORPSEstep
+  rhizo_till$inorganicN <- shared_inorganicN
+  if(min(rhizo_till<0)) {crash('Value is rhizo_till < 0')}
+  
+  rhizo <- rhizo + results_rhizo*CORPSEstep
+  rhizo$inorganicN <- shared_inorganicN
+  if(min(rhizo<0)) {crash('Value is rhizo < 0')}
+  
+  litter <- litter + results_litter*CORPSEstep
+  litter$inorganicN <- shared_inorganicN
+  if(min(litter<0)) {crash('Value is litter < 0')}
+  
+  # print counter in R console
+  if (input$doy[i]==1) print(paste("day", input$doy[i], "of year",  
+                                   input$nyr[i], "of", max(input$nyr), 
+                                   "total years", sep = " "))
+  
+  # Keep track of latest data
+  bulk_till_final_list[[i]] <- bulk_till
+  bulk_final_list[[i]] <- bulk
+  rhizo_till_final_list[[i]] <- rhizo_till
+  rhizo_final_list[[i]] <- rhizo
+  litter_final_list[[i]] <- litter
+  
+  ## Given that the rhizopshere is not static (i.e., roots forage) there   
+  ## are two processes that need to occur:
+  ## 1) The rhizosphere size changes each time step with root biomass
+  ## 2) The rhizosphere and bulk soil mix.   
+  
+  ## Calculate change in rhizosphere between time steps
+  ## t function transposes data frame
+
+  # rhizo_frac needs to be between 0 and 1
+  rhizo_frac <- input$rhizo_frac[i]
+
+  ## CORPSE calculates cumulative CO2 release. 
+  ## This code keeps track of CO2 from each soil pool so that it is 
+  ## maintained when the soils are mixed.  Further down the code the CO2 is   ## reassigned to individual layers.
+  CO2_bulk_till <- bulk_till$CO2 
+  CO2_bulk <- bulk$CO2 #
+  CO2_rhizo_till <- rhizo_till$CO2
+  CO2_rhizo <- rhizo$CO2
+  CO2_litter <- litter$CO2
+  
+  ## Mix bulk soil and rhizo soil together during growing season using 
+  ## froot_turnover_fraction
+
+  froot_turnover_fraction <- 1/365 
+
+  soilMix_bulk_till <- froot_turnover_fraction*bulk_till
+  soilMix_bulk <- froot_turnover_fraction*bulk
+  soilMix_rhizo_till <- froot_turnover_fraction*rhizo_till
+  soilMix_rhizo <- froot_turnover_fraction*rhizo
+
+  soilMix <- soilMix_bulk + soilMix_rhizo
+  soilMix_till <- soilMix_bulk_till + soilMix_rhizo_till
+ 
+  bulk_till <- bulk_till-soilMix_bulk_till
+  rhizo_till <- rhizo_till-soilMix_rhizo_till
+  bulk_till <- bulk_till+(soilMix_till*(1.0-rhizo_frac))
+  rhizo_till <- rhizo_till+(soilMix_till*(rhizo_frac))
+
+  bulk <- bulk-soilMix_bulk
+  rhizo <- rhizo-soilMix_rhizo
+  bulk <- bulk+(soilMix*(1.0-rhizo_frac))
+  rhizo <- rhizo+(soilMix*(rhizo_frac))
+  
+  ## Each crop has unique leaf/root litter fastfracs  
+  ## Add leaf litter inputs to litter layer 
+  leaf_ffrac <- input$leaf_litter_fastfrac[i]
+  litter$uFastC <- litter$uFastC+(litter_production_c[i]*leaf_ffrac)
+  litter$uSlowC <- litter$uSlowC+(litter_production_c[i]*(1-leaf_ffrac))
+  litter$uFastN <- litter$uFastN+((litter_production_n[i]*leaf_ffrac))
+  litter$uSlowN <- litter$uSlowN+((litter_production_n[i]*(1-leaf_ffrac)))
+  
+  ## Add root litter inputs to the tilled rhizosphere
+  root_ffrac <- input$root_litter_fastfrac[i]
+  rhizo_till$uFastC <- rhizo_till$uFastC+(froot_turnover_c[i]*pct_till*
+                         root_ffrac*rhizo_frac)
+  rhizo_till$uSlowC <- rhizo_till$uSlowC+(froot_turnover_c[i]*pct_till*
+                         (1-root_ffrac)*rhizo_frac)
+  rhizo_till$uFastN <- rhizo_till$uFastN+(froot_turnover_n[i]*pct_till*
+                         root_ffrac*rhizo_frac)
+  rhizo_till$uSlowN <- rhizo_till$uSlowN+(froot_turnover_n[i]*pct_till*
+                         (1-root_ffrac)*rhizo_frac)
+  
+  ## Add root litter inputs to the rhizosphere
+  rhizo$uFastC <- rhizo$uFastC+(froot_turnover_c[i]*(1-pct_till)*
+                    root_ffrac*rhizo_frac)
+  rhizo$uSlowC <- rhizo$uSlowC+(froot_turnover_c[i]*(1-pct_till)*
+                                  (1-root_ffrac)*rhizo_frac)
+  rhizo$uFastN <- rhizo$uFastN+(froot_turnover_n[i]*(1-pct_till)*
+                    root_ffrac*rhizo_frac)
+  rhizo$uSlowN <- rhizo$uSlowN+(froot_turnover_n[i]*(1-pct_till)*
+                    (1-root_ffrac)*rhizo_frac)
+  
+  ## Add root litter inputs to the tilled bulk soil
+  bulk_till$uFastC <- bulk_till$uFastC+(froot_turnover_c[i]*pct_till
+                                      *root_ffrac*(1-rhizo_frac))
+  bulk_till$uSlowC <- bulk_till$uSlowC+(froot_turnover_c[i]*pct_till*
+                        (1-root_ffrac)*(1-rhizo_frac))
+  bulk_till$uFastN <- bulk_till$uFastN+(froot_turnover_n[i]*pct_till*
+                        root_ffrac*(1-rhizo_frac))
+  bulk_till$uSlowN <- bulk_till$uSlowN+(froot_turnover_n[i]*pct_till*
+                        (1-root_ffrac)*(1-rhizo_frac))
+  
+  ## Add root litter inputs to the bulk soil
+  bulk$uFastC <- bulk$uFastC+(froot_turnover_c[i]*(1-pct_till)*
+                                root_ffrac*(1-rhizo_frac))
+  bulk$uSlowC <- bulk$uSlowC+(froot_turnover_c[i]*(1-pct_till)*
+                                (1-root_ffrac)*(1-rhizo_frac))
+  bulk$uFastN <- bulk$uFastN+(froot_turnover_n[i]*(1-pct_till)*
+                                root_ffrac*(1-rhizo_frac))
+  bulk$uSlowN <- bulk$uSlowN+(froot_turnover_n[i]*(1-pct_till)*
+                                (1-root_ffrac)*(1-rhizo_frac))
+  
+  
+  ## Transfer a fraction of litter to bulk and rhizosphere each time step
+  newsoil <- litter*litter_transfer_to_soil
+  ## Divide the newsoil into till and non till according till layer size
+  rhizo_till <- rhizo_till+(newsoil*pct_till*rhizo_frac)
+  bulk_till <- bulk_till+(newsoil*pct_till*(1-rhizo_frac))
+  rhizo <- rhizo+(newsoil*(1-pct_till)*(rhizo_frac))
+  bulk <- bulk+(newsoil*(1-pct_till)*(1-rhizo_frac))
+  litter <- litter-(litter*litter_transfer_to_soil)
+  
+  ## Add fungal production to bulk and rhizo layers Fast C and N
+  fungal_prod2 <- fungal_prod[i,]
+  rhizo_till$uFastC <- rhizo_till$uFastC+(fungal_prod2*pct_till*rhizo_frac)
+  rhizo_till$uFastN <- 
+    rhizo_till$uFastN+(((fungal_prod2*pct_till)/exudate_CN)*rhizo_frac)
+  
+  rhizo$uFastC <- rhizo$uFastC+(fungal_prod2*(1-pct_till)*rhizo_frac)
+  rhizo$uFastN <- 
+    rhizo$uFastN+(((fungal_prod2*(1-pct_till))/exudate_CN)*rhizo_frac)
+  
+  bulk_till$uFastC <- 
+    bulk_till$uFastC+(fungal_prod2*pct_till*(1-rhizo_frac))
+  bulk_till$uFastN <- 
+    bulk_till$uFastN+(((fungal_prod2*pct_till)/exudate_CN)*(1-rhizo_frac))
+  
+  bulk$uFastC <- bulk$uFastC+(fungal_prod2*(1-pct_till)*(1-rhizo_frac))
+  bulk$uFastN <- 
+    bulk$uFastN+(((fungal_prod2*(1-pct_till))/exudate_CN)*(1-rhizo_frac))
+  
+  ## Add non mycorrhizal C flux to rhizosphere
+  rhizoC_flux2 <- rhizoC_flux[i,]
+  rhizo_till$uFastC <- rhizo_till$uFastC+rhizoC_flux2*pct_till
+  rhizo$uFastC <- rhizo$uFastC+rhizoC_flux2*(1-pct_till)
+  
+  
+  ## ORGANIC MATTER ADDITION
+  ## add to litter layer, lignin fraction to slow pool, rest to fast pool
+
+   if (input$omad[i] == 1){
+     litter$uFastC <- litter$uFastC + ((input$omadc[i] / 1000) * (1 - 0.5))
+     
+     litter$uSlowC <- litter$uSlowC + ((input$omadc[i] / 1000) * 0.5)
+     
+     litter$uFastN <- 
+       litter$uFastN + (((input$omadc[i] / 1000) * (1 - 0.5) / 40))
+     
+     litter$uSlowN <- 
+       litter$uSlowN + (((input$omadc[i] / 1000) * 0.5) / 40)
+   }
+
+
+  ## TILLAGE Moving protectedC to unprotectedC
+  ## First a fraction of litter and rhizo mixes into bulk soil
+  ## Then protected SOM converts to unprotected in rhizo_till and bulk_till
+   if (input$cult[i] == 1) {
+    soilMix_rhizo <- rhizo_till * input$cultrhizmix[i]
+    bulk_till <- bulk_till + soilMix_rhizo
+    rhizo_till <- rhizo_till - soilMix_rhizo
+    bulk_till <- bulk_till + (litter * input$cultlitmix[i])
+    litter <- litter * (1 - input$cultlitmix[i])
+
+    rhizo_till$uFastC<-rhizo_till$uFastC+(rhizo_till$pFastC*tillPtoUP)
+    rhizo_till$pFastC<-rhizo_till$pFastC-(rhizo_till$pFastC*tillPtoUP)
+    rhizo_till$uFastN<-rhizo_till$uFastN+(rhizo_till$pFastN*tillPtoUP)
+    rhizo_till$pFastN<-rhizo_till$pFastN-(rhizo_till$pFastN*tillPtoUP)
+
+    rhizo_till$uSlowC<-rhizo_till$uSlowC+(rhizo_till$pSlowC*tillPtoUP)
+    rhizo_till$pSlowC<-rhizo_till$pSlowC-(rhizo_till$pSlowC*tillPtoUP)
+    rhizo_till$uSlowN<-rhizo_till$uSlowN+(rhizo_till$pSlowN*tillPtoUP)
+    rhizo_till$pSlowN<-rhizo_till$pSlowN-(rhizo_till$pSlowN*tillPtoUP)
+
+    rhizo_till$uNecroC<-rhizo_till$uNecroC+(rhizo_till$pNecroC*tillPtoUP)
+    rhizo_till$pNecroC<-rhizo_till$pNecroC-(rhizo_till$pNecroC*tillPtoUP)
+    rhizo_till$uNecroN<-rhizo_till$uNecroN+(rhizo_till$pNecroN*tillPtoUP)
+    rhizo_till$pNecroN<-rhizo_till$pNecroN-(rhizo_till$pNecroN*tillPtoUP)
+
+    bulk_till$uFastC<-bulk_till$uFastC+(bulk_till$pFastC*tillPtoUP)
+    bulk_till$pFastC<-bulk_till$pFastC-(bulk_till$pFastC*tillPtoUP)
+    bulk_till$uFastN<-bulk_till$uFastN+(bulk_till$pFastN*tillPtoUP)
+    bulk_till$pFastN<-bulk_till$pFastN-(bulk_till$pFastN*tillPtoUP)
+
+    bulk_till$uSlowC<-bulk_till$uSlowC+(bulk_till$pSlowC*tillPtoUP)
+    bulk_till$pSlowC<-bulk_till$pSlowC-(bulk_till$pSlowC*tillPtoUP)
+    bulk_till$uSlowN<-bulk_till$uSlowN+(bulk_till$pSlowN*tillPtoUP)
+    bulk_till$pSlowN<-bulk_till$pSlowN-(bulk_till$pSlowN*tillPtoUP)
+
+    bulk_till$uNecroC<-bulk_till$uNecroC+(bulk_till$pNecroC*tillPtoUP)
+    bulk_till$pNecroC<-bulk_till$pNecroC-(bulk_till$pNecroC*tillPtoUP)
+    bulk_till$uNecroN<-bulk_till$uNecroN+(bulk_till$pNecroN*tillPtoUP)
+    bulk_till$pNecroN<-bulk_till$pNecroN-(bulk_till$pNecroN*tillPtoUP)
+    }
+
+  ## FERTILIZER
+  ## add N to shared inorganic N pool
+  if (input$fert[i] == 1){
+    shared_inorganicN <- shared_inorganicN + (input$fertamt[i] / 1000)
+  }
+
+  ## Reassign CO2 values to each pool
+  bulk_till$CO2<-CO2_bulk_till
+  bulk$CO2<-CO2_bulk
+  rhizo_till$CO2<-CO2_rhizo_till
+  rhizo$CO2<-CO2_rhizo
+  litter$CO2<-CO2_litter
+  
+  
+  ## Fill in the second column of each datatable with values from the 
+  ## first- because code is designed to run with at least 2 sites
+  bulk_till[2,] <- bulk_till[1,]
+  bulk[2,] <- bulk[1,]
+  rhizo_till[2,] <- rhizo_till[1,]
+  rhizo[2,] <- rhizo[1,]
+  litter[2,] <- litter[1,]
+  
+  ## END of CORPSE main loop
+  
+  
+  ## FUN Model 
+  
+  for (j in 1:nsites) {
+    ## Update FUN shared_inorganic N with CORPSE shared_inorganic N    
+    FUN_shared_inorganicN[i, j] <- shared_inorganicN[1]
+    
+    ## Start of FUN model main loop
+    ## Assume passive uptake with transpiration is zero  
+    Npassive[i,j]<-0
+    
+    Npassive[i,j]<-pmin(Npassive[i,j],FUN_shared_inorganicN[i,j]) 
+    
+    ## Calculate soil N remaining- update N pool after any passive uptake
+    rsoilN[i,j]<-FUN_shared_inorganicN[i,j]-Npassive[i,j]
+ 
+    ## Sum passive and storage N allocation 
+    free[i,j]<-Npassive[i,j]
+    
+    ## Calculate the cost for each uptake strategy
+    ## N fixation costs
+    cost_fix[i,j] <- 
+      (s_fix*exp(a_fix+b_fix*soilT[k]*(1-0.5*soilT[k]/c_fix))-2*s_fix)
+    
+    ## Make the cost of retranslocation high during green season
+    cost_resorb[i,j] <- Inf
+    
+    ## Update FUN model shared_inorganic N with remaining soil N calculated
+    FUN_shared_inorganicN[i,j] <- rsoilN[i,j]
+    
+    ## Cost of non mycorrhizal uptake - +inf
+    cost_non_myco[i,j] <- 
+      (Non_kN/FUN_shared_inorganicN[i,j])+(Non_kC/daily_root_bio_juv[i,j])
+    
+    ## Cost of mycorrhizal uptake - +inf
+    cost_active[i,j] <- 
+      (kN/FUN_shared_inorganicN[i,j])+(kC/daily_root_bio_juv[i,j])
+   
+    ## Make cost of N storage high after growing season
+    
+    leafNdaystorage <- 365 
+    
+    if(leafN[i,1] == 1){ # if it is a last day
+      leafNdaystorage <- input$doy[i] # assign leafNdaystorage to DOY
+    }
+    
+    if(input$doy[i] > leafNdaystorage){ # infinite storage cost after DOY
+      cost_storage[i,j]<-Inf
+    }
+    
+    if(input$doy[i] > 364){ # reset the leafNdaystorage for each year
+      leafNdaystorage <- input$doy[i]
+    }
+    
+    
+    ## Make cost of N storage high if storage N is equal to 0
+    if (FUNstorageN[i,j]<=0) {
+      cost_storage[i,j]<-Inf
+    }
+    
+    ## Add a retranslocation function that calculates at an annual scale
+    ## and spreads over the senescence period 
+    
+    ## Calculate cost of resorption 
+    ## leafN is a df w/ same # rows as input & columns 1:4 = 
+    ## 1) input$last (0,1),
+    ## 2) input$harv (0,1),
+    ## 3) input$aglivn (continuous), and 
+    ## 4) retranslocatable leaf N pool (continuous)
+    leafNday <- 365
+    leafN2 <- 0 # initialize a new value
+    if (leafN[i,1] == 1) { # if a last day...
+      cost_resorb[i,j]<-kR/leafN[i,4] # calculate resorb cost
+      leafN2 <- leafN[i,4] # set leafN2 = retranslocatable leaf N pool
+      leafNday <- input$doy[i] # set leafNday = doy
+    } # Else leafN2 <- 0
+    
+    ## Use resistance network to get integrated cost 
+    rec_cost_acq[i,j]<-(
+      (1/cost_active[i,j])
+      +(1/cost_fix[i,j])
+      +(1/cost_resorb[i,j])
+      +(1/cost_non_myco[i,j])
+      +(1/cost_storage[i,j])
+    )
+    
+    cost_acq[i,j]<-(1/rec_cost_acq[i,j])
+    
+    ## This code simultaneously solves eqs. 6a-6d from Fisher et al. 2010
+    ## to optimize C allocated to growth and N uptake. N uptake is 
+    ## truncated if Ndemand is met or leaf N pool is exhausted. 
+    
+    ## Add in storage N demand to pool 
+    if (leafN[i,1] == 1) { # if it is a last day...
+      Ndemand_plus_storage[i,j]<-totalNdemand[i-1,j]+storageNdemand[i]
+      ## Add in storage C into NPP or C available pool
+      NPP_plus_storage[i,j]<-NPP[i-1,j]+storageC[i] 
+    } else {
+      NPP_plus_storage[i,j]<-NPP[i,j]
+      Ndemand_plus_storage[i,j]<-totalNdemand[i,j]
+    }
+    
+    Cavailable[i,j]<-NPP_plus_storage[i,j]
+    Ndeficit[i,j]<-Ndemand_plus_storage[i,j]
+    
+    if (Ndeficit[i,j]<=0) {
+      Nacq[i,j]<-0
+      Cacq[i,j]<-0
+      Cgrowth[i,j]<-Cgrowth[i,j]
+    }
+    
+    
+    if (Ndeficit[i,j]>0) {
+      Cacq[i,j]<-(Cavailable[i,j]-(free[i,j]*(plantCN[i,j])))/
+                 (1+(plantCN[i,j])/cost_acq[i,j])
+      Nacq[i,j]<-pmin(Ndeficit[i,j],(Cacq[i,j]/cost_acq[i,j]))
+      Cgrowth[i,j]<-Cavailable[i,j]-(Nacq[i,j]*cost_acq[i,j])
+      
+      total_Nacq_active[i,j]<-Cacq[i,j]/cost_active[i,j]
+      total_Nacq_non_myco[i,j]<-Cacq[i,j]/cost_non_myco[i,j]
+      total_Nacq_resorb[i,j]<-Cacq[i,j]/cost_resorb[i,j]
+      total_Nacq_fix[i,j]<-Cacq[i,j]/cost_fix[i,j]
+      total_Nacq_storage[i,j]<-Cacq[i,j]/cost_storage[i,j]
+    }
+    
+    total_Nacq_storage[i]<-pmin(total_Nacq_storage[i,j],FUNstorageN[i,j]) 
+    
+    total_Nacq[i,j]<-( 
+      total_Nacq_active[i,j]
+      +total_Nacq_fix[i,j]
+      +total_Nacq_non_myco[i,j]
+      +total_Nacq_resorb[i,j]
+      +total_Nacq_storage[i,j]
+    )
+    
+    if (total_Nacq[i,j]>Ndeficit[i,j]){
+      Nacq_scaler<-Ndeficit[i,j]/total_Nacq[i,j]
+      total_Nacq_active[i,j]<-total_Nacq_active[i,j]*Nacq_scaler
+      total_Nacq_fix[i,j]<-total_Nacq_fix[i,j]*Nacq_scaler
+      total_Nacq_non_myco[i,j]<-total_Nacq_non_myco[i,j]*Nacq_scaler
+      total_Nacq_resorb[i,j]<-total_Nacq_resorb[i,j]*Nacq_scaler
+      total_Nacq_storage[i,j]<-total_Nacq_storage[i,j]*Nacq_scaler
+    }
+    
+    ## Truncate resorption if exceeds leaf N
+    if (total_Nacq_resorb[i,j]>leafN2) { # should be day before harvest
+      total_Nacq_resorb[i,j]<-leafN2
+      Cgrowth[i,j]<-Cavailable[i,j]-(Nacq[i,j]*cost_acq[i,j])
+    }
+   
+    ## Update Storage N pool to include retranslocation
+    if (leafN[i,1] == 0) { #  if not a last day...
+      FUNstorageN[i+1,j]<-FUNstorageN[i,j]-total_Nacq_storage[i,j]
+    } 
+    
+    if(FUNstorageN[i+1,j] < 0){
+      FUNstorageN[i+1,j] <- 0
+    }
+    
+    if (leafN[i,1] == 1) { # if a last day...
+      total_Nacq_active[i,j]<-0
+      total_Nacq_fix[i,j]<-0
+      total_Nacq_non_myco[i,j]<-0
+      FUNstorageN[i+1,j]<-(
+        FUNstorageN[i,j]
+        +total_Nacq_resorb[i,j]
+        +total_Nacq_active[i,j]
+        +total_Nacq_non_myco[i,j]
+        +total_Nacq_fix[i,j]  
+      )
+    }
+    
+    if (input$doy[i] > leafNday) { # harvest date
+      FUNstorageN[i+1,j]<-FUNstorageN[i,j]-total_Nacq_storage[i,j]
+    } 
+  
+     if (leafN[i,1] == 1){ 
+      resorbper[j]<-(1-(total_Nacq_resorb[i,j]/leafN2))
+      litter_productionN[i,j]<-(leafN[i,j]*resorbper[j])
+      litter_productionCN[i,j]<-litter_production_c[i]/litter_production_n[i]
+    }
+    
+    total_soil_N_uptake[i,j]<-total_Nacq_active[i,j]+total_Nacq_non_myco[i,j]
+    
+    ## Scale FUN inorganic N based on N uptake calculated by FUN
+    if(total_soil_N_uptake[i,j]>FUN_shared_inorganicN[i,j]) {
+      N_uptakescaler[i,j]<-FUN_shared_inorganicN[i,j]/total_soil_N_uptake[i,j]
+      total_Nacq_active[i,j]<- total_Nacq_active[i,j]*N_uptakescaler[i,j]
+      total_Nacq_non_myco[i,j]<-total_Nacq_non_myco[i,j]*N_uptakescaler[i,j]
+      total_soil_N_uptake[i,j]<-FUN_shared_inorganicN[i,j]
+    } else {
+      N_uptakescaler[i,j]<-0
+    }
+    
+    total_Nacq[i,j]<-(
+      total_Nacq_active[i,j]
+      +total_Nacq_fix[i,j]
+      +total_Nacq_non_myco[i,j]
+      +total_Nacq_resorb[i,j]
+      +total_Nacq_storage[i,j]
+    )
+    
+  }
+  
+  ## Update Corpse model shared_inorganic N pool with FUN inorganic N pool
+  shared_inorganicN<-FUN_shared_inorganicN[i,]-total_soil_N_uptake[i,]
+  
+  ## Calculate fungal production and rhizosphere C flux to input into 
+  ## CORPSE model
+  if(i<timestep){
+    fungal_prod[i+1,]<- total_Nacq_active[i,]*cost_acq[i,] 
+    rhizoC_flux[i+1,]<- total_Nacq_non_myco[i,]*cost_acq[i,]
+  }
+  
+  ##end of FUN model main loop
+}
+
+```
+
+
+```{r Prepare Data for Export}
+
+### CORPSE data to export
+
+# Combine daily data saved in lists into dataframe for each soil layer
+bulk_till_final <- do.call(rbind,bulk_till_final_list)
+bulk_final <- do.call(rbind,bulk_final_list)
+rhizo_till_final <- do.call(rbind,rhizo_till_final_list)
+rhizo_final <- do.call(rbind,rhizo_final_list)
+litter_final <- do.call(rbind,litter_final_list)
+
+# Subset every other row of output data for export, because every other row is a different "site" but here we ran only one site
+bulk_till_final_export <- bulk_till_final[seq(1, nrow(bulk_till_final), 2), ] 
+bulk_final_export <- bulk_final[seq(1, nrow(bulk_final), 2), ] 
+rhizo_till_final_export <-rhizo_till_final[seq(1, nrow(rhizo_till_final), 2), ]
+rhizo_final_export <- rhizo_final[seq(1, nrow(rhizo_final), 2), ] 
+litter_final_export <- litter_final[seq(1, nrow(litter_final), 2), ] 
+
+# Add values from soil layers together to calculate total soil values
+final_totals <- bulk_till_final + bulk_final + rhizo_till_final + rhizo_final + litter_final
+#subset every other row for export, because every other row is a different "site" but here we ran only one site
+final_total_export <- final_totals[seq(1, nrow(final_totals), 2), ] 
+
+# Create datatables of total soil value of each C and N pool
+uFastC <- t(matrix(final_totals$uFastC,nrow=nsites))
+uSlowC <- t(matrix(final_totals$uSlowC,nrow=nsites))
+uNecroC<-t(matrix(final_totals$uNecroC,nrow=nsites))
+pFastC<-t(matrix(final_totals$pFastC,nrow=nsites))
+pSlowC<-t(matrix(final_totals$pSlowC,nrow=nsites))
+pNecroC<-t(matrix(final_totals$pNecroC,nrow=nsites))
+uFastN<-t(matrix(final_totals$uFastN,nrow=nsites))
+uSlowN<-t(matrix(final_totals$uSlowN,nrow=nsites))
+uNecroN<-t(matrix(final_totals$uNecroN,nrow=nsites))
+pFastN<-t(matrix(final_totals$pFastN,nrow=nsites))
+pSlowN<-t(matrix(final_totals$pSlowN,nrow=nsites))
+pNecroN<-t(matrix(final_totals$pNecroN,nrow=nsites))
+livingMicrobeC<-t(matrix(final_totals$livingMicrobeC,nrow=nsites))
+livingMicrobeN<-t(matrix(final_totals$livingMicrobeN,nrow=nsites))
+inorganicN<-t(matrix(final_totals$inorganicN,nrow=nsites))##goes to fun
+total_CO2<-t(matrix(final_totals$CO2,nrow=nsites))
+total_livingMicrobeN<-t(matrix(final_totals$livingMicrobeN,nrow=nsites))
+
+
+##Calculate total soil carbon
+totalsoilC <- uFastC+uSlowC+uNecroC+pFastC+pSlowC+pNecroC+livingMicrobeC
+
+# Prepare total C data frame
+# first prepare a column of dates to cbind to total C dataframe below
+date_col <- as.data.frame(1:(nrow(totalsoilC)+39)) # add # of leap days during run (Update this number for different runs)
+colnames(date_col) <- c("cumday")
+date_col$date <- as.Date(date_col$cumday, origin = as.Date("1846-12-31"))
+date_col$monthday <- format(date_col$date, format = "%m-%d")
+date_col <- subset(date_col, monthday != "02-29") # remove leap days
+
+# make total carbon data frame
+tc <- 
+  data.frame("c" = totalsoilC[,1]) %>% 
+  mutate(doy = input$doy,
+         yr = input$yr,
+         cumday = 1:nrow(totalsoilC),
+         pctc = (c/(c[1]))*100,
+         date = date_col$date)
+
+
+# calculate total soil N
+totalsoilN<-uFastN+uSlowN+uNecroN+pFastN+pSlowN+pNecroN+livingMicrobeN
+
+# make total N data frame
+tn <- 
+  data.frame("n" = totalsoilN[,1]) %>% 
+  mutate(doy = input$doy,
+         yr = input$yr,
+         cumday = 1:nrow(totalsoilN),
+         pctn = (n/(n[1]))*100,
+         date = date_col$date)
+
+# Prepare data frame of protected to unprotected SOC
+protection_ratios <- 
+  data.frame(date = date_col[,c("date")])  %>%
+  mutate(whole_soil_ratio = (final_total_export$pFastC+final_total_export$pSlowC+final_total_export$pNecroC)/(final_total_export$uFastC+final_total_export$uSlowC+final_total_export$uNecroC)) 
+
+
+### FUN data to export
+
+# Make a data frame of N acquired from each pathway, then calculate total N acquired, root facilitated N acquired, and percent for each pathway
+FUN_N <- 
+  data.frame("date" = tc$date,
+             "zActive" = total_Nacq_active[, 1],
+             "Fix" = total_Nacq_fix[, 1],
+             "Non_myco" = total_Nacq_non_myco[, 1],
+             "Storage" = total_Nacq_storage[, 1],
+             "Resorb" = total_Nacq_resorb[, 1]) %>%
+  mutate(TotalNacq = zActive + Fix + Non_myco + Storage + Resorb,
+         rootFacilitated = zActive + Non_myco, 
+         zActive_pct = (zActive/TotalNacq)*100, 
+         Fix_pct = (Fix/TotalNacq)*100, 
+         Non_myco_pct = (Non_myco/TotalNacq)*100, 
+         Storage_pct = (Storage/TotalNacq)*100, 
+         Resorb_pct = (Resorb/TotalNacq)*100, 
+         rootFacilitated_pct = (rootFacilitated/TotalNacq)*100)
+
+
+
+# Make a data frame of C spent on N acquired by each pathway, then calculate total C spent, root facilitated C spent, and percent for each pathway
+FUN_C <- 
+  data.frame("date" = tc$date,
+             "zActive" = total_Nacq_active[, 1],
+             "Fix" = total_Nacq_fix[, 1],
+             "Non_myco" = total_Nacq_non_myco[, 1],
+             "Storage" = total_Nacq_storage[, 1],
+             "Resorb" = total_Nacq_resorb[, 1],
+             "cost_acq" = cost_acq[,1]) %>%
+  mutate(Total_Cspent = (zActive + Fix + Non_myco + Storage + 
+                           Resorb)*cost_acq,
+         rootFacilitated_Cspent = (zActive + Non_myco)*cost_acq,
+         zActive_Cspent = zActive*cost_acq, 
+         Fix_Cspent = Fix*cost_acq, 
+         Non_myco_Cspent = Non_myco*cost_acq, 
+         Storage_Cspent = Storage*cost_acq, 
+         Resorb_Cspent = Resorb*cost_acq, 
+         rootFacilitated_Cspent_pct = 
+           (rootFacilitated_Cspent/Total_Cspent)*100,
+         zActive_Cspent_pct = (zActive_Cspent/Total_Cspent)*100, 
+         Fix_Cspent_pct =  (Fix_Cspent/Total_Cspent)*100, 
+         Non_myco_Cspent_pct = (Non_myco_Cspent/Total_Cspent)*100, 
+         Storage_Cspent_pct = (Storage_Cspent/Total_Cspent)*100, 
+         Resorb_Cspent_pct = (Resorb_Cspent/Total_Cspent)*100) %>%
+  select(date, cost_acq:Resorb_Cspent_pct) 
+
+
+# bind all FUN Matrices together in one data frame for export
+FUN_Matrices <- 
+  data.frame("Npassive" = Npassive[,1],
+             "free" = free[,1],
+             "storageNmob" = storageNmob[,1],
+             "FUNstorageN" = FUNstorageN[2:nrow(FUNstorageN),1], 
+             "cost_active" = cost_active[,1],
+             "cost_fix" = cost_fix[,1],
+             "cost_resorb" = cost_resorb[,1],
+             "cost_non_myco" = cost_non_myco[,1],
+             "cost_acq" = cost_acq[,1],
+             "rec_cost_acq" = rec_cost_acq[,1],
+             "Cgrowth" = Cgrowth[,1],
+             "Cacq" = Cacq[,1],
+             "Nacq" = Nacq[,1],
+             "Cavailable" = Cavailable[,1],
+             "rsoilN" = rsoilN[,1],
+             "Ndeficit" = Ndeficit[,1],
+             "total_Nacq" = total_Nacq[,1],
+             "total_Cgrowth" = total_Cgrowth[,1],
+             "total_Nacq_active" = total_Nacq_active[,1],
+             "total_Nacq_resorb" = total_Nacq_resorb[,1],
+             "total_Nacq_fix" = total_Nacq_fix[,1],
+             "total_Nacq_non_myco" = total_Nacq_non_myco[,1],
+             "total_Nacq_storage" = total_Nacq_storage[,1],
+             "litter_productionN" = litter_productionN[,1],
+             "litter_productionCN" = litter_productionCN[,1],
+             "rhizoC_flux" = rhizoC_flux[,1],
+             "fungal_prod" = fungal_prod[,1],
+             "Ndemand_plus_storage" = Ndemand_plus_storage[,1],
+             "NPP_plus_storage" = NPP_plus_storage[,1],
+             "resorbper" = resorbper[,1],
+             "cost_storage" = cost_storage[,1],
+             "FUN_shared_inorganicN" = FUN_shared_inorganicN[,1],
+             "total_soil_N_uptake" = total_soil_N_uptake[,1],
+             "N_uptakescaler" = N_uptakescaler[,1]
+             )
+
+
+```
+
+
+```{r Export Results}
+
+# Results are in kg C/m2
+
+### Export CORPSE Data
+
+# Export All Data- all different soil pools, layers summed together
+write.csv(final_total_export, "CORPSE_all pools sum of layers.csv", row.names = FALSE)
+
+# Export total soil C data 
+# (sum of uFastC+uSlowC+uNecroC+pFastC+pSlowC+pNecroC+livingMicrobeC)
+write.csv(tc, "CORPSE_total soil C.csv", row.names = FALSE)
+
+# Export total soil N data 
+# (sum of uFastN+uSlowN+uNecroN+pFastN+pSlowN+pNecroN+livingMicrobeN)
+write.csv(tn, "CORPSE_total soil N.csv", row.names = FALSE)
+
+# Export protected:unprotected C ratios
+write.csv(protection_ratios, "CORPSE_protection ratios.csv", row.names = FALSE)
+
+
+# Export time series
+write.csv(bulk_final_export, "CORPSE_bulk_time series.csv", row.names = FALSE)
+
+write.csv(bulk_till_final_export, "CORPSE_bulk_till_time series.csv", row.names = FALSE)
+
+write.csv(rhizo_final_export, "CORPSE_rhizo_time series.csv", row.names = FALSE)
+
+write.csv(rhizo_till_final_export, "CORPSE_rhizo_till_time series.csv", row.names = FALSE)
+
+write.csv(litter_final_export, "CORPSE_litter_time series.csv", row.names = FALSE)
+ 
+ 
+# Export final data point (Results are in kg C/m2)
+write.csv(bulk_final_export[length(bulk_final_export$uFastC),], "CORPSE_bulk_last point.csv", row.names = FALSE)
+
+write.csv(bulk_till_final_export[length(bulk_till_final_export$uFastC),], "CORPSE_bulk_till_last point.csv", row.names = FALSE)
+
+write.csv(rhizo_final_export[length(rhizo_final_export$uFastC),], "CORPSE_rhizo_last point.csv", row.names = FALSE)
+
+write.csv(rhizo_till_final_export[length(rhizo_till_final_export$uFastC),], "CORPSE_rhizo_till_last point.csv", row.names = FALSE)
+
+write.csv(litter_final_export[length(litter_final_export$uFastC),], "CORPSE_litter_last point.csv", row.names = FALSE)
+
+
+### Export FUN Data
+
+# N acquired by different pathways
+write.csv(FUN_N, "FUN_Nacq.csv", row.names = FALSE)
+
+# C spent on each N acquisition pathway
+write.csv(FUN_C, "FUN_Cspent.csv", row.names = FALSE)
+
+# Export all FUN matrices
+write.csv(FUN_Matrices, "FUN_AllMatrices.csv", row.names = FALSE)
+
+
+```
+
+
+```{r Graph C Remaining}
+
+# C remaining graph (kg/m^2)
+ggplot() +
+  geom_line(data = tc, aes(x = date, y = c), 
+            color = "black") +
+  labs(y = expression(Carbon~remaining~(kg~m^{-2})),
+       x = "Year",
+       title = "Soil Carbon simulated by FUN-BioCROP",
+       subtitle = "1846-2007")+
+  theme(title = element_text(hjust=0.5))
+
+
+```
