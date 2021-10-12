@@ -7,7 +7,7 @@ editor_options:
   chunk_output_type: console
 ---
 
-For full information see ReadMe file: "ReadMe_FUN-BioCROP.md"
+For full information see ReadMe file: "README.md"
 
 This code runs the FUN-BioCROP model,  a version of FUN-CORPSE (Sulman et al 2017 Ecology Letters) that we modified for bioenergy systems.
 
