@@ -1,6 +1,8 @@
 # FUN-BioCROP
 Bioenergy model of plant C spent on N acquisition and SOM cycling
 
+[![DOI](https://zenodo.org/badge/412558745.svg)](https://zenodo.org/badge/latestdoi/412558745)
+
 **Model name:** “FUN-BioCROP.Rmd”
 
 **Creators:** Stephanie Juice, Christopher Walter, Kara Allen, Danielle Berardi, Tara Hudiburg, Benjamin Sulman, Edward Brzostek
