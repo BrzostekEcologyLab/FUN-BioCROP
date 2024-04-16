@@ -1,5 +1,7 @@
 # FUN-BioCROP
-Bioenergy model of plant C spent on N acquisition and SOM cycling
+Bioenergy model of plant C spent on N acquisition and SOM cycling.  
+
+**NOTE:** This is a legacy version of the FUN-BioCROP model that was published in GCB Bioenergy in 2022 (citation below). The newest version of the model is in the FUN-BioCROP-LIDET repository. 
 
 [![DOI](https://zenodo.org/badge/412558745.svg)](https://zenodo.org/badge/latestdoi/412558745)
 
@@ -9,9 +11,12 @@ Bioenergy model of plant C spent on N acquisition and SOM cycling
 
 **Contact information:** stephanie.juice@mail.wvu.edu, erbrzostek@mix.wvu.edu 
 
+**Related publication:**  
+Juice, S. M., Walter, C. A., Allen, K. E., Berardi, D. M., Hudiburg, T. W., Sulman, B. N., & Brzostek, E. R. (2022). A new bioenergy model that simulates the impacts of plant-microbial interactions, soil carbon protection, and mechanistic tillage on soil carbon cycling. GCB Bioenergy, 14, 346–363. https://doi.org/10.1111/gcbb.12914
+
 **Software**: R
 
-**Accompanying files**: 
+**Accompanying files:**  
 
 1.    CORPSE function code: **CORPSE Functions_Bioenergy.R**
 
